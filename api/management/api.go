@@ -208,6 +208,22 @@ type UserStatus struct {
 	NumberOfCredentials *int    `json:"numberOfCredentials,omitempty"`
 }
 
+// UserExportRepresentation struct
+type UserExportRepresentation struct {
+	ID                      *string `json:"id"`
+	Username                *string `json:"username"`
+	FirstName               *string `json:"firstName,omitempty"`
+	LastName                *string `json:"lastName,omitempty"`
+	Email                   *string `json:"email,omitempty"`
+	EmailVerified           *bool   `json:"emailVerified,omitempty"`
+	PhoneNumber             *string `json:"phoneNumber,omitempty"`
+	PhoneNumberVerified     *bool   `json:"phoneNumberVerified,omitempty"`
+	AccountStatus           *string `json:"accountStatus"`
+	AuthenticatorsNumber    *int    `json:"authenticatorsNumber"`
+	CreatedTimestamp        *int64  `json:"createdTimestamp"`
+	LastConnectionTimestamp *int64  `json:"lastConnectionTimestamp,omitempty"`
+}
+
 // BackOffice configuration keys
 const (
 	BOConfKeyCustomers = "customers"
@@ -879,6 +895,27 @@ func ConvertToAPIUserChecks(checks []dto.DBCheck) []UserCheck {
 		})
 	}
 	return res
+}
+
+// ToUserExportRepresentation creates a UserExportRepresentation from a keycloak UserRepresentation
+func ToUserExportRepresentation(kcUser kc.UserRepresentation) UserExportRepresentation {
+	var phoneNumberVerified, _ = kcUser.GetAttributeBool("phoneNumberVerified")
+	var defaultStatus = "UNLOCKED"
+	var defaultAuthNumber = 0
+	return UserExportRepresentation{
+		ID:                      kcUser.ID,
+		Username:                kcUser.Username,
+		FirstName:               kcUser.FirstName,
+		LastName:                kcUser.LastName,
+		Email:                   kcUser.Email,
+		EmailVerified:           kcUser.EmailVerified,
+		PhoneNumber:             kcUser.GetAttributeString("phoneNumber"),
+		PhoneNumberVerified:     phoneNumberVerified,
+		AccountStatus:           &defaultStatus,
+		AuthenticatorsNumber:    &defaultAuthNumber,
+		CreatedTimestamp:        kcUser.CreatedTimestamp,
+		LastConnectionTimestamp: nil,
+	}
 }
 
 // Regular expressions for parameters validation

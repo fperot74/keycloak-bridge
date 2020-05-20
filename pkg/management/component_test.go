@@ -30,6 +30,7 @@ type componentMocks struct {
 	keycloakClient        *mock.KeycloakClient
 	usersDetailsDBModule  *mock.UsersDetailsDBModule
 	eventDBModule         *mock.EventDBModule
+	eventsReader          *mock.EventsReader
 	configurationDBModule *mock.ConfigurationDBModule
 	onboardingModule      *mock.OnboardingModule
 	transaction           *mock.Transaction
@@ -41,6 +42,7 @@ func createMocks(mockCtrl *gomock.Controller) componentMocks {
 		keycloakClient:        mock.NewKeycloakClient(mockCtrl),
 		usersDetailsDBModule:  mock.NewUsersDetailsDBModule(mockCtrl),
 		eventDBModule:         mock.NewEventDBModule(mockCtrl),
+		eventsReader:          mock.NewEventsReader(mockCtrl),
 		configurationDBModule: mock.NewConfigurationDBModule(mockCtrl),
 		onboardingModule:      mock.NewOnboardingModule(mockCtrl),
 		transaction:           mock.NewTransaction(mockCtrl),
@@ -57,8 +59,8 @@ const (
 )
 
 func createComponent(mocks componentMocks) Component {
-	return NewComponent(mocks.keycloakClient, mocks.usersDetailsDBModule, mocks.eventDBModule, mocks.configurationDBModule, mocks.onboardingModule,
-		allowedTrustIDGroups, socialRealmName, mocks.logger)
+	return NewComponent(mocks.keycloakClient, mocks.usersDetailsDBModule, mocks.eventDBModule, mocks.eventsReader,
+		mocks.configurationDBModule, mocks.onboardingModule, allowedTrustIDGroups, socialRealmName, mocks.logger)
 }
 
 func ptrString(value string) *string {
@@ -401,6 +403,91 @@ func TestGetRequiredActions(t *testing.T) {
 		_, err := managementComponent.GetRequiredActions(ctx, "master")
 
 		assert.NotNil(t, err)
+	})
+}
+
+func TestExportUsers(t *testing.T) {
+	var mockCtrl = gomock.NewController(t)
+	defer mockCtrl.Finish()
+
+	var mocks = createMocks(mockCtrl)
+	var component = createComponent(mocks)
+
+	var accessToken = "ACCESS_TOKEN=="
+	var userRealm = "user-realm"
+	var queryRealm = "query-realm"
+	var ctx = context.TODO()
+
+	ctx = context.WithValue(ctx, cs.CtContextAccessToken, accessToken)
+	ctx = context.WithValue(ctx, cs.CtContextRealm, userRealm)
+
+	mocks.logger.EXPECT().Warn(gomock.Any(), gomock.Any()).AnyTimes()
+
+	t.Run("Keycloak get users fails", func(t *testing.T) {
+		var kcError = errors.New("keycloak error")
+		mocks.keycloakClient.EXPECT().GetUsers(accessToken, userRealm, queryRealm, gomock.Any()).Return(kc.UsersPageRepresentation{}, kcError)
+
+		var _, err = component.ExportUsers(ctx, queryRealm)
+		assert.Equal(t, kcError, err)
+	})
+	t.Run("Keycloak get users returns empty result", func(t *testing.T) {
+		mocks.keycloakClient.EXPECT().GetUsers(accessToken, userRealm, queryRealm, gomock.Any()).Return(kc.UsersPageRepresentation{}, nil)
+
+		var res, err = component.ExportUsers(ctx, queryRealm)
+		assert.Nil(t, err)
+		assert.Len(t, res, 0)
+	})
+
+	// Now, Keycloak will always returns 3 valid users
+	var count = 3
+	var userID1 = "user-id-1"
+	var userID2 = "user-id-2"
+	var userID3 = "user-id-3"
+	var usersResp = kc.UsersPageRepresentation{
+		Count: &count,
+		Users: []kc.UserRepresentation{kc.UserRepresentation{ID: &userID1}, kc.UserRepresentation{ID: &userID2}, kc.UserRepresentation{ID: &userID3}},
+	}
+	mocks.keycloakClient.EXPECT().GetUsers(accessToken, userRealm, queryRealm, gomock.Any()).Return(usersResp, nil).AnyTimes()
+
+	t.Run("DB UsersLastLogin fails", func(t *testing.T) {
+		var dbError = errors.New("db fails")
+		mocks.eventsReader.EXPECT().GetUsersLastLogin(ctx, queryRealm).Return(map[string]int64{}, dbError)
+
+		var _, err = component.ExportUsers(ctx, queryRealm)
+		assert.Equal(t, dbError, err)
+	})
+
+	// Now, DB will always returns last logins for user1 and user2
+	var anyTimestamp = int64(123456789)
+	mocks.eventsReader.EXPECT().GetUsersLastLogin(ctx, queryRealm).Return(map[string]int64{userID1: anyTimestamp, userID2: anyTimestamp}, nil).AnyTimes()
+
+	t.Run("GetLockedUsers fails", func(t *testing.T) {
+		var kcError = errors.New("keycloak.glu error")
+		mocks.keycloakClient.EXPECT().GetLockedUsers(accessToken, userRealm, queryRealm).Return(nil, kcError)
+
+		var _, err = component.ExportUsers(ctx, queryRealm)
+		assert.Equal(t, kcError, err)
+	})
+
+	// Now, Keycloak will always return a valid response. User3 is locked
+	mocks.keycloakClient.EXPECT().GetLockedUsers(accessToken, userRealm, queryRealm).Return([]string{userID3}, nil).AnyTimes()
+
+	t.Run("GetUsersAuthenticatorsCount fails", func(t *testing.T) {
+		var kcError = errors.New("keycloak.guac error")
+		mocks.keycloakClient.EXPECT().GetUsersAuthenticatorsCount(accessToken, userRealm, queryRealm).Return(nil, kcError)
+
+		var _, err = component.ExportUsers(ctx, queryRealm)
+		assert.Equal(t, kcError, err)
+	})
+
+	// Now, Keycloak will always return a valid response.
+	mocks.keycloakClient.EXPECT().GetUsersAuthenticatorsCount(accessToken, userRealm, queryRealm).Return(map[string]int{userID1: 1, userID2: 2, userID3: 3}, nil).AnyTimes()
+
+	t.Run("Success", func(t *testing.T) {
+		var res, err = component.ExportUsers(ctx, queryRealm)
+
+		assert.Nil(t, err)
+		assert.Len(t, res, 3)
 	})
 }
 
@@ -1919,7 +2006,6 @@ func TestGetGroupsOfUser(t *testing.T) {
 
 	var mocks = createMocks(mockCtrl)
 	var managementComponent = createComponent(mocks)
-
 	var accessToken = "TOKEN=="
 	var realmName = "master"
 	var userID = "789-789-456"

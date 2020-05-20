@@ -88,7 +88,7 @@ func TestGetClientEndpoint(t *testing.T) {
 	assert.NotNil(t, res)
 }
 
-func TestGetClientsEndpoint(t *testing.T) {
+func TestPerRealmEndpoints(t *testing.T) {
 	var mockCtrl = gomock.NewController(t)
 	defer mockCtrl.Finish()
 
@@ -113,17 +113,32 @@ func TestGetRequiredActionsEndpoint(t *testing.T) {
 
 	var mockManagementComponent = mock.NewManagementComponent(mockCtrl)
 
-	var e = MakeGetRequiredActionsEndpoint(mockManagementComponent)
-
 	var realm = "master"
 	var ctx = context.Background()
 	var req = make(map[string]string)
 	req[prmRealm] = realm
 
-	mockManagementComponent.EXPECT().GetRequiredActions(ctx, realm).Return([]api.RequiredActionRepresentation{}, nil).Times(1)
-	var res, err = e(ctx, req)
-	assert.Nil(t, err)
-	assert.NotNil(t, res)
+	t.Run("GetClients", func(t *testing.T) {
+		var e = MakeGetClientsEndpoint(mockManagementComponent)
+		mockManagementComponent.EXPECT().GetClients(ctx, realm).Return([]api.ClientRepresentation{}, nil).Times(1)
+		var res, err = e(ctx, req)
+		assert.Nil(t, err)
+		assert.NotNil(t, res)
+	})
+	t.Run("GetRequiredActions", func(t *testing.T) {
+		var e = MakeGetRequiredActionsEndpoint(mockManagementComponent)
+		mockManagementComponent.EXPECT().GetRequiredActions(ctx, realm).Return([]api.RequiredActionRepresentation{}, nil).Times(1)
+		var res, err = e(ctx, req)
+		assert.Nil(t, err)
+		assert.NotNil(t, res)
+	})
+	t.Run("ExportUsers", func(t *testing.T) {
+		var e = MakeExportUsersEndpoint(mockManagementComponent)
+		mockManagementComponent.EXPECT().ExportUsers(ctx, realm).Return([]api.UserExportRepresentation{}, nil).Times(1)
+		var res, err = e(ctx, req)
+		assert.Nil(t, err)
+		assert.NotNil(t, res)
+	})
 }
 
 func TestCreateUserEndpoint(t *testing.T) {
