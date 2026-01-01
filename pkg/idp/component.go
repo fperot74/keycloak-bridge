@@ -18,8 +18,12 @@ import (
 type KeycloakIdpClient interface {
 	// Groups
 	GetGroups(accessToken string, realmName string) ([]kc.GroupRepresentation, error)
+	// Role mappings
+	GetRealmLevelRoleMappings(accessToken string, realmName, userID string) ([]kc.RoleRepresentation, error)
 	// Users
 	GetUsers(accessToken string, reqRealmName, targetRealmName string, paramKV ...string) (kc.UsersPageRepresentation, error)
+	GetUser(accessToken string, realmName, userID string) (kc.UserRepresentation, error)
+	UpdateUser(accessToken string, realmName, userID string, user kc.UserRepresentation) error
 	DeleteUser(accessToken string, realmName, userID string) error
 	GetGroupsOfUser(accessToken string, realmName, userID string) ([]kc.GroupRepresentation, error)
 	// IDP
@@ -49,8 +53,10 @@ type Component interface {
 	CreateIdentityProviderMapper(ctx context.Context, realmName string, idpAlias string, apiMapper api.IdentityProviderMapperRepresentation) error
 	UpdateIdentityProviderMapper(ctx context.Context, realmName string, idpAlias string, mapperID string, apiMapper api.IdentityProviderMapperRepresentation) error
 	DeleteIdentityProviderMapper(ctx context.Context, realmName string, idpAlias string, mapperID string) error
-	GetUsersWithAttribute(ctx context.Context, realmName string, groupName string, attributeKey string, attributeValue string) ([]api.UserRepresentation, error)
+	GetUsersWithAttribute(ctx context.Context, realmName string, username *string, groupName *string, expectedAttributes map[string]string, needRoles *bool) ([]api.UserRepresentation, error)
 	DeleteUser(ctx context.Context, realmName string, userID string, groupName *string) error
+	AddUserAttribute(ctx context.Context, realmName string, userID string, attributeKey string, attributeValue string) error
+	DeleteUserAttribute(ctx context.Context, realmName string, userID string, attributeKey string) error
 	GetUserFederatedIdentities(ctx context.Context, realmName string, userID string) ([]api.FederatedIdentityRepresentation, error)
 }
 
@@ -389,25 +395,122 @@ func (c *component) getGroup(ctx context.Context, accessToken string, realmName 
 	return nil, errorhandler.CreateBadRequestError(msg.MsgErrInvalidParam + ".group")
 }
 
-func (c *component) GetUsersWithAttribute(ctx context.Context, realmName string, groupName string, attributeKey string, attributeValue string) ([]api.UserRepresentation, error) {
+func (c *component) GetUsersWithAttribute(ctx context.Context, realmName string, username *string, groupName *string, expectedAttributes map[string]string, needRoles *bool) ([]api.UserRepresentation, error) {
 	accessToken, err := c.tokenProvider.ProvideTokenForRealm(ctx, realmName)
 	if err != nil {
 		c.logger.Warn(ctx, "msg", "Failed to get OIDC token from keycloak", "err", err.Error())
 		return nil, err
 	}
 
-	group, err := c.getGroup(ctx, accessToken, realmName, groupName)
-	if err != nil {
-		return nil, err
+	var paramKV = []string{}
+
+	if username != nil {
+		paramKV = append(paramKV, "username", *username)
 	}
 
-	usersPage, err := c.keycloakIdpClient.GetUsers(accessToken, "master", realmName, "groupId", *group.ID, "q", fmt.Sprintf("%s:%s", attributeKey, attributeValue))
+	if groupName != nil {
+		group, err := c.getGroup(ctx, accessToken, realmName, *groupName)
+		if err != nil {
+			return nil, err
+		}
+		paramKV = append(paramKV, "groupId", *group.ID)
+	}
+
+	if len(expectedAttributes) > 0 {
+		// Compute query to search for custom attributes, in the format 'key1:value2 key2:value2'
+		var querySearch string
+		var first = true
+		for attributeKey, attributeValue := range expectedAttributes {
+			if first {
+				first = false
+			} else {
+				querySearch = querySearch + " "
+			}
+			querySearch += fmt.Sprintf("%s:%s", attributeKey, attributeValue)
+		}
+		paramKV = append(paramKV, "q", querySearch)
+	}
+
+	usersPage, err := c.keycloakIdpClient.GetUsers(accessToken, "master", realmName, paramKV...)
 	if err != nil {
-		c.logger.Warn(ctx, "msg", "Keycloak failed to search users", "err", err.Error(), "realm", realmName, "group", *group.ID)
+		c.logger.Warn(ctx, "msg", "Keycloak failed to search users", "err", err.Error(), "realm", realmName)
 		return nil, err
+	}
+	if usersPage.Count == nil || *usersPage.Count == 0 || usersPage.Users == nil || len(usersPage.Users) == 0 {
+		var res = make([]api.UserRepresentation, 0)
+		return res, nil
+	}
+
+	if needRoles != nil && *needRoles {
+		for idx, user := range usersPage.Users {
+			roles, err := c.keycloakIdpClient.GetRealmLevelRoleMappings(accessToken, realmName, *user.ID)
+			if err != nil {
+				c.logger.Warn(ctx, "msg", "Keycloak failed to get user groups", "err", err.Error(), "realm", realmName, "user", *user.ID)
+				return nil, err
+			}
+			var roleNames []string
+			for _, role := range roles {
+				roleNames = append(roleNames, *role.Name)
+			}
+			usersPage.Users[idx].RealmRoles = &roleNames
+		}
 	}
 
 	return api.ConvertToAPIUserRepresentations(usersPage.Users), nil
+}
+
+func (c *component) AddUserAttribute(ctx context.Context, realmName string, userID string, attributeKey string, attributeValue string) error {
+	return c.updateUser(ctx, realmName, userID, func(user kc.UserRepresentation) bool {
+		var key = kc.AttributeKey(attributeKey)
+		if user.Attributes == nil {
+			var attributes = make(kc.Attributes)
+			attributes.SetString(key, attributeValue)
+			user.Attributes = &attributes
+			return true // Newly added
+		}
+		var current = user.Attributes.GetString(key)
+		if current == nil || *current != attributeValue {
+			user.Attributes.SetString(key, attributeValue)
+			return true // Updated attribute
+		}
+		return false // No need to update. Attribute already has the expected value
+	})
+}
+
+func (c *component) DeleteUserAttribute(ctx context.Context, realmName string, userID string, attributeKey string) error {
+	return c.updateUser(ctx, realmName, userID, func(user kc.UserRepresentation) bool {
+		var key = kc.AttributeKey(attributeKey)
+		if user.Attributes == nil {
+			return false // No need to updated. No attribute exists
+		}
+		var value = user.Attributes.GetString(key)
+		if value == nil || *value == "" {
+			return false // No need to update. Attribute does not exist or is empty
+		}
+		user.Attributes.Remove(key)
+		return true
+	})
+}
+
+func (c *component) updateUser(ctx context.Context, realmName string, userID string, updateFunc func(user kc.UserRepresentation) bool) error {
+	accessToken, err := c.tokenProvider.ProvideTokenForRealm(ctx, realmName)
+	if err != nil {
+		c.logger.Warn(ctx, "msg", "Failed to get OIDC token from keycloak", "err", err.Error())
+		return err
+	}
+	user, err := c.keycloakIdpClient.GetUser(accessToken, realmName, userID)
+	if err != nil {
+		c.logger.Warn(ctx, "msg", "Failed to get Keycloak user", "err", err.Error(), "realm", realmName, "user", userID)
+		return err
+	}
+	if updateFunc(user) {
+		err = c.keycloakIdpClient.UpdateUser(accessToken, realmName, userID, user)
+		if err != nil {
+			c.logger.Warn(ctx, "msg", "Failed to update Keycloak user", "err", err.Error(), "realm", realmName, "user", userID)
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *component) GetUserFederatedIdentities(ctx context.Context, realmName string, userID string) ([]api.FederatedIdentityRepresentation, error) {

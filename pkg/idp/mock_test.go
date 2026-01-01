@@ -19,6 +19,10 @@ func ptr(value string) *string {
 	return &value
 }
 
+func ptrInt(value int) *int {
+	return &value
+}
+
 func toJSON(data any) string {
 	bytes, _ := json.Marshal(data)
 	return string(bytes)

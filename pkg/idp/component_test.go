@@ -3,6 +3,7 @@ package idp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	cs "github.com/cloudtrust/common-service/v2"
@@ -140,7 +141,7 @@ func createTestKcFedIdentities() []kc.FederatedIdentityRepresentation {
 	return []kc.FederatedIdentityRepresentation{kcFedIdentity1, kcFedIdentity2}
 }
 
-func createTestApiFedIdentities() []api.FederatedIdentityRepresentation {
+func createTestAPIFedIdentities() []api.FederatedIdentityRepresentation {
 	apiFedIdentity1 := api.FederatedIdentityRepresentation{
 		UserID:           ptr(fedUserID1),
 		Username:         ptr(fedUsername1),
@@ -785,10 +786,8 @@ func TestGetUsersWithAttribute(t *testing.T) {
 	var (
 		idpComponent   = mocks.createComponent()
 		group          = kc.GroupRepresentation{ID: ptr("the-group-id"), Name: ptr("the-group-name")}
-		attribKey      = "the-key"
-		attribValue    = "the-value"
-		kcUser         = kc.UserRepresentation{}
-		kcSearchResult = kc.UsersPageRepresentation{Users: []kc.UserRepresentation{kcUser, kcUser}}
+		kcUser         = kc.UserRepresentation{ID: ptr("the-user-id"), Username: ptr("the-username")}
+		kcSearchResult = kc.UsersPageRepresentation{Count: ptrInt(2), Users: []kc.UserRepresentation{kcUser, kcUser}}
 		anyError       = errors.New("any error")
 		ctx            = context.TODO()
 	)
@@ -797,32 +796,175 @@ func TestGetUsersWithAttribute(t *testing.T) {
 
 	t.Run("Fails to get technical access token", func(t *testing.T) {
 		mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return("", anyError)
-		_, err := idpComponent.GetUsersWithAttribute(ctx, realmName, *group.Name, attribKey, attribValue)
+		_, err := idpComponent.GetUsersWithAttribute(ctx, realmName, nil, group.Name, map[string]string{}, nil)
 		assert.Error(t, err)
 	})
 
 	t.Run("Fails to check group", func(t *testing.T) {
 		mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
 		mocks.keycloakIdpClient.EXPECT().GetGroups(accessToken, realmName).Return(nil, anyError)
-		_, err := idpComponent.GetUsersWithAttribute(ctx, realmName, *group.Name, attribKey, attribValue)
+		_, err := idpComponent.GetUsersWithAttribute(ctx, realmName, nil, group.Name, map[string]string{}, nil)
 		assert.Error(t, err)
 	})
 
 	t.Run("Fails to search for users", func(t *testing.T) {
 		mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
 		mocks.keycloakIdpClient.EXPECT().GetGroups(accessToken, realmName).Return([]kc.GroupRepresentation{group}, nil)
-		mocks.keycloakIdpClient.EXPECT().GetUsers(accessToken, "master", realmName, "groupId", *group.ID, "q", gomock.Any()).Return(kcSearchResult, anyError)
-		_, err := idpComponent.GetUsersWithAttribute(ctx, realmName, *group.Name, attribKey, attribValue)
+		mocks.keycloakIdpClient.EXPECT().GetUsers(accessToken, "master", realmName, "groupId", *group.ID).Return(kcSearchResult, anyError)
+		_, err := idpComponent.GetUsersWithAttribute(ctx, realmName, nil, group.Name, map[string]string{}, nil)
 		assert.Error(t, err)
 	})
 
-	t.Run("Success", func(t *testing.T) {
+	t.Run("UserPage count is 0 even if kcUser is not empty", func(t *testing.T) {
+		var emptySearchResult = kc.UsersPageRepresentation{Count: ptrInt(0), Users: []kc.UserRepresentation{kcUser, kcUser}}
 		mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
 		mocks.keycloakIdpClient.EXPECT().GetGroups(accessToken, realmName).Return([]kc.GroupRepresentation{group}, nil)
-		mocks.keycloakIdpClient.EXPECT().GetUsers(accessToken, "master", realmName, "groupId", *group.ID, "q", gomock.Any()).Return(kcSearchResult, nil)
-		res, err := idpComponent.GetUsersWithAttribute(ctx, realmName, *group.Name, attribKey, attribValue)
+		mocks.keycloakIdpClient.EXPECT().GetUsers(accessToken, "master", realmName, "groupId", *group.ID).Return(emptySearchResult, nil)
+		res, err := idpComponent.GetUsersWithAttribute(ctx, realmName, nil, group.Name, map[string]string{}, nil)
+		assert.NoError(t, err)
+		assert.Len(t, res, 0)
+	})
+
+	t.Run("Success without role", func(t *testing.T) {
+		var (
+			key1   = "the-key"
+			value1 = "the-value"
+			key2   = "another-key"
+			value2 = "another-value"
+			query1 = fmt.Sprintf("%s:%s %s:%s", key1, value1, key2, value2)
+			query2 = fmt.Sprintf("%s:%s %s:%s", key2, value2, key1, value1)
+		)
+		mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+		mocks.keycloakIdpClient.EXPECT().GetGroups(accessToken, realmName).Return([]kc.GroupRepresentation{group}, nil)
+		mocks.keycloakIdpClient.EXPECT().GetUsers(accessToken, "master", realmName, gomock.Any()).DoAndReturn(func(_, _, _ any, args ...any) (kc.UsersPageRepresentation, error) {
+			querySearch := args[3].(string)
+			if querySearch != query1 && querySearch != query2 {
+				t.Errorf("Expected query to be '%s' or '%s', but got '%s'", query1, query2, querySearch)
+			}
+			return kcSearchResult, nil
+		})
+		res, err := idpComponent.GetUsersWithAttribute(ctx, realmName, nil, group.Name, map[string]string{key1: value1, key2: value2}, ptrBool(false))
 		assert.NoError(t, err)
 		assert.Len(t, res, 2)
+	})
+
+	t.Run("Can't get roles", func(t *testing.T) {
+		kcSearchResult = kc.UsersPageRepresentation{Count: ptrInt(1), Users: []kc.UserRepresentation{kcUser}}
+		mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+		mocks.keycloakIdpClient.EXPECT().GetGroups(accessToken, realmName).Return([]kc.GroupRepresentation{group}, nil)
+		mocks.keycloakIdpClient.EXPECT().GetUsers(accessToken, "master", realmName, gomock.Any()).Return(kcSearchResult, nil)
+		mocks.keycloakIdpClient.EXPECT().GetRealmLevelRoleMappings(accessToken, realmName, *kcSearchResult.Users[0].ID).Return(nil, anyError)
+		_, err := idpComponent.GetUsersWithAttribute(ctx, realmName, kcUser.Username, group.Name, map[string]string{}, ptrBool(true))
+		assert.Error(t, err)
+	})
+
+	t.Run("Success with roles", func(t *testing.T) {
+		kcSearchResult = kc.UsersPageRepresentation{Count: ptrInt(1), Users: []kc.UserRepresentation{kcUser}}
+		mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+		mocks.keycloakIdpClient.EXPECT().GetGroups(accessToken, realmName).Return([]kc.GroupRepresentation{group}, nil)
+		mocks.keycloakIdpClient.EXPECT().GetUsers(accessToken, "master", realmName, gomock.Any()).Return(kcSearchResult, nil)
+		mocks.keycloakIdpClient.EXPECT().GetRealmLevelRoleMappings(accessToken, realmName, *kcSearchResult.Users[0].ID).Return([]kc.RoleRepresentation{{ID: ptr("role-id-1"), Name: ptr("role #1")}, {ID: ptr("role-id-2"), Name: ptr("role #2")}}, nil)
+		res, err := idpComponent.GetUsersWithAttribute(ctx, realmName, nil, group.Name, map[string]string{}, ptrBool(true))
+		assert.NoError(t, err)
+		assert.Len(t, res, 1)
+		assert.Len(t, res[0].RealmRoles, 2)
+	})
+}
+
+func TestAddDeleteUserAttributes(t *testing.T) {
+	var mocks = createMocks(t)
+	defer mocks.finish()
+
+	var (
+		idpComponent = mocks.createComponent()
+		userID       = "the-user-id"
+		attribKey    = "the-attribute-key"
+		attribValue  = "the-attribute-value"
+		anyError     = errors.New("any error")
+		ctx          = context.TODO()
+	)
+
+	mocks.logger.EXPECT().Warn(gomock.Any(), gomock.Any()).AnyTimes()
+
+	t.Run("Fails to get technical access token", func(t *testing.T) {
+		mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return("", anyError)
+		err := idpComponent.AddUserAttribute(ctx, realmName, userID, attribKey, attribValue)
+		assert.Error(t, err)
+	})
+	t.Run("Fails to get user", func(t *testing.T) {
+		mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+		mocks.keycloakIdpClient.EXPECT().GetUser(accessToken, realmName, userID).Return(kc.UserRepresentation{}, anyError)
+		err := idpComponent.AddUserAttribute(ctx, realmName, userID, attribKey, attribValue)
+		assert.Error(t, err)
+	})
+	t.Run("Fails to update user", func(t *testing.T) {
+		mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+		mocks.keycloakIdpClient.EXPECT().GetUser(accessToken, realmName, userID).Return(kc.UserRepresentation{Attributes: nil}, nil)
+		mocks.keycloakIdpClient.EXPECT().UpdateUser(accessToken, realmName, userID, gomock.Any()).Return(anyError)
+		err := idpComponent.AddUserAttribute(ctx, realmName, userID, attribKey, attribValue)
+		assert.Error(t, err)
+	})
+
+	t.Run("Add attribute", func(t *testing.T) {
+		t.Run("Success adding first attribute", func(t *testing.T) {
+			mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+			mocks.keycloakIdpClient.EXPECT().GetUser(accessToken, realmName, userID).Return(kc.UserRepresentation{Attributes: nil}, nil)
+			mocks.keycloakIdpClient.EXPECT().UpdateUser(accessToken, realmName, userID, gomock.Any()).Return(nil)
+			err := idpComponent.AddUserAttribute(ctx, realmName, userID, attribKey, attribValue)
+			assert.NoError(t, err)
+		})
+		t.Run("Success adding not yet existing attribute", func(t *testing.T) {
+			mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+			mocks.keycloakIdpClient.EXPECT().GetUser(accessToken, realmName, userID).Return(kc.UserRepresentation{Attributes: &kc.Attributes{}}, nil)
+			mocks.keycloakIdpClient.EXPECT().UpdateUser(accessToken, realmName, userID, gomock.Any()).Return(nil)
+			err := idpComponent.AddUserAttribute(ctx, realmName, userID, attribKey, attribValue)
+			assert.NoError(t, err)
+		})
+		t.Run("Success adding existing attribute with different value", func(t *testing.T) {
+			kcUser := kc.UserRepresentation{Attributes: &kc.Attributes{kc.AttributeKey(attribKey): []string{"some-other-value"}}}
+			mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+			mocks.keycloakIdpClient.EXPECT().GetUser(accessToken, realmName, userID).Return(kcUser, nil)
+			mocks.keycloakIdpClient.EXPECT().UpdateUser(accessToken, realmName, userID, gomock.Any()).Return(nil)
+			err := idpComponent.AddUserAttribute(ctx, realmName, userID, attribKey, attribValue)
+			assert.NoError(t, err)
+		})
+		t.Run("Success when attribute is already set with expected value", func(t *testing.T) {
+			kcUser := kc.UserRepresentation{Attributes: &kc.Attributes{kc.AttributeKey(attribKey): []string{attribValue}}}
+			mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+			mocks.keycloakIdpClient.EXPECT().GetUser(accessToken, realmName, userID).Return(kcUser, nil)
+			err := idpComponent.AddUserAttribute(ctx, realmName, userID, attribKey, attribValue)
+			assert.NoError(t, err)
+		})
+	})
+
+	t.Run("Delete attribute", func(t *testing.T) {
+		t.Run("Success with nil attributes", func(t *testing.T) {
+			mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+			mocks.keycloakIdpClient.EXPECT().GetUser(accessToken, realmName, userID).Return(kc.UserRepresentation{Attributes: nil}, nil)
+			err := idpComponent.DeleteUserAttribute(ctx, realmName, userID, attribKey)
+			assert.NoError(t, err)
+		})
+		t.Run("Success with empty attributes", func(t *testing.T) {
+			mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+			mocks.keycloakIdpClient.EXPECT().GetUser(accessToken, realmName, userID).Return(kc.UserRepresentation{Attributes: &kc.Attributes{}}, nil)
+			err := idpComponent.DeleteUserAttribute(ctx, realmName, userID, attribKey)
+			assert.NoError(t, err)
+		})
+		t.Run("Success with existing empty attribute", func(t *testing.T) {
+			kcUser := kc.UserRepresentation{Attributes: &kc.Attributes{kc.AttributeKey(attribKey): []string{""}}}
+			mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+			mocks.keycloakIdpClient.EXPECT().GetUser(accessToken, realmName, userID).Return(kcUser, nil)
+			err := idpComponent.DeleteUserAttribute(ctx, realmName, userID, attribKey)
+			assert.NoError(t, err)
+		})
+		t.Run("Success with existing non-empty attribute", func(t *testing.T) {
+			kcUser := kc.UserRepresentation{Attributes: &kc.Attributes{kc.AttributeKey(attribKey): []string{attribValue}}}
+			mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return(accessToken, nil)
+			mocks.keycloakIdpClient.EXPECT().GetUser(accessToken, realmName, userID).Return(kcUser, nil)
+			mocks.keycloakIdpClient.EXPECT().UpdateUser(accessToken, realmName, userID, gomock.Any()).Return(nil)
+			err := idpComponent.DeleteUserAttribute(ctx, realmName, userID, attribKey)
+			assert.NoError(t, err)
+		})
 	})
 }
 
@@ -840,7 +982,7 @@ func TestGetUserFederatedIdentities(t *testing.T) {
 	mocks.logger.EXPECT().Warn(gomock.Any(), gomock.Any()).AnyTimes()
 
 	kcFedIdentities := createTestKcFedIdentities()
-	expectedResult := createTestApiFedIdentities()
+	expectedResult := createTestAPIFedIdentities()
 
 	t.Run("Failed to get technical access token", func(t *testing.T) {
 		mocks.tokenProvider.EXPECT().ProvideTokenForRealm(ctx, realmName).Return("", anyError)
